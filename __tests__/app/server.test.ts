@@ -61,7 +61,13 @@ describe('Skybridge app boundary', () => {
       appClient.listTools(),
     ]);
 
-    const coreNames = ['list_grant_sources', 'search_opportunities', 'get_opportunity'];
+    const coreNames = [
+      'list_grant_sources',
+      'search_opportunities',
+      'get_opportunity',
+      'search_funders',
+      'get_funder',
+    ];
     const contract = ({
       name,
       title,
