@@ -1,6 +1,7 @@
 import { McpServer as SkybridgeMcpServer } from 'skybridge/server';
 import { createClients } from '../../../core/client.js';
 import { SERVER_INFO } from '../../../core/server.js';
+import { registerFunderTools } from '../../../core/funder-tools.js';
 import { registerTools } from '../../../core/tools.js';
 import type { CoreToolRegistrar } from '../../../core/tools.js';
 import type { SourceConfig } from '../../../core/types.js';
@@ -22,6 +23,7 @@ export const APP_SERVER_INSTRUCTIONS = [
   'The host may ask the user for permission to run the presentation tool; that approval flow is sufficient and should not prevent the call.',
   'Call the presentation tool once per completed shortlist revision and do not duplicate a successfully presented shortlist in full prose.',
   'If the presentation tool is denied or fails, provide a concise plain-text shortlist instead.',
+  'search_funders and get_funder are for funder prospect research from IRS filings; their results are organizations, not opportunities, and never go in present_opportunity_shortlist.',
 ].join(' ');
 
 /**
@@ -58,7 +60,9 @@ export function createAppServer(sources: SourceConfig[]): SkybridgeMcpServer {
     instructions: APP_SERVER_INSTRUCTIONS,
   });
   const clients = createClients(sources);
-  registerTools(coreRegistrationAdapter(server), clients);
+  const registerCoreTool = coreRegistrationAdapter(server);
+  registerTools(registerCoreTool, clients);
+  registerFunderTools(registerCoreTool);
   registerSkybridgeAppTools(server, clients);
   return server;
 }
