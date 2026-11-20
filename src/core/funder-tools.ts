@@ -9,8 +9,15 @@ import {
 } from './funders.js';
 import type { IFunderClient } from './funders.js';
 
+const MAX_ERROR_LENGTH = 200;
+
+/** One short line: the assistant reads this, so no stack traces or issue dumps. */
 function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  const message = err instanceof Error ? err.message : String(err);
+  const firstLine = message.split('\n', 1)[0]!.trim() || 'Funder lookup failed';
+  return firstLine.length > MAX_ERROR_LENGTH
+    ? `${firstLine.slice(0, MAX_ERROR_LENGTH - 3)}...`
+    : firstLine;
 }
 
 const funderSummarySchema = z.object({
@@ -102,6 +109,11 @@ export function registerFunderTools(
         page: z.number().int().positive(),
         hasNextPage: z.boolean().nullable(),
         nextPage: z.number().int().positive().nullable(),
+        skipped: z
+          .number()
+          .int()
+          .nonnegative()
+          .describe('Rows on this page left out because ProPublica sent them in an unusable shape'),
         error: z.string().nullable(),
         attribution: z.string(),
       },
@@ -111,7 +123,7 @@ export function registerFunderTools(
       const { query, state, page } = searchFundersInputSchema.parse(input);
       try {
         const result = await client.searchOrganizations({ query, state, page });
-        const hasNextPage = page < result.totalPages;
+        const hasNextPage = result.totalPages == null ? null : page < result.totalPages;
         const structuredContent = {
           status: result.organizations.length === 0 ? ('empty' as const) : ('success' as const),
           organizations: result.organizations,
@@ -119,6 +131,7 @@ export function registerFunderTools(
           page,
           hasNextPage,
           nextPage: hasNextPage ? page + 1 : null,
+          skipped: result.skipped,
           error: null,
           attribution: PROPUBLICA_ATTRIBUTION,
         };
@@ -131,6 +144,7 @@ export function registerFunderTools(
           page,
           hasNextPage: null,
           nextPage: null,
+          skipped: 0,
           error: errorMessage(err),
           attribution: PROPUBLICA_ATTRIBUTION,
         };

@@ -22,11 +22,16 @@ export const PROPUBLICA_ATTRIBUTION =
 const PAGE_SIZE = 25;
 /** How many filings to list per organization, most recent first. */
 const MAX_FILINGS = 10;
+/** How long to wait for ProPublica before giving up on a request. */
+export const PROPUBLICA_TIMEOUT_MS = 10_000;
+
+/** ProPublica usually sends EINs as numbers; tolerate digit strings too. */
+const einSchema = z.union([z.number().int().nonnegative(), z.string().regex(/^\d{1,9}$/)]);
 
 // Upstream shapes are validated loosely: only the fields this client reads.
 const searchOrganizationSchema = z
   .object({
-    ein: z.number().int(),
+    ein: einSchema,
     name: z.string(),
     city: z.string().nullish(),
     state: z.string().nullish(),
@@ -34,18 +39,20 @@ const searchOrganizationSchema = z
   })
   .passthrough();
 
+// Rows are validated one at a time so a single odd record is skipped instead
+// of failing the whole page; the counts fall back to null when unusable.
 const searchResponseSchema = z
   .object({
-    total_results: z.number().int().nonnegative(),
-    num_pages: z.number().int().nonnegative(),
-    organizations: z.array(searchOrganizationSchema),
+    total_results: z.number().int().nonnegative().nullable().catch(null),
+    num_pages: z.number().int().nonnegative().nullable().catch(null),
+    organizations: z.array(z.unknown()).default([]),
   })
   .passthrough();
 
 const filingWithDataSchema = z
   .object({
     tax_prd_yr: z.number().int(),
-    formtype: z.number().int(),
+    formtype: z.number().int().nullish(),
     pdf_url: z.string().nullish(),
     totrevenue: z.number().nullish(),
     totfuncexpns: z.number().nullish(),
@@ -67,7 +74,7 @@ const organizationResponseSchema = z
   .object({
     organization: z
       .object({
-        ein: z.number().int(),
+        ein: einSchema,
         name: z.string(),
         city: z.string().nullish(),
         state: z.string().nullish(),
@@ -79,8 +86,9 @@ const organizationResponseSchema = z
         income_amount: z.number().nullish(),
       })
       .passthrough(),
-    filings_with_data: z.array(filingWithDataSchema).default([]),
-    filings_without_data: z.array(filingWithoutDataSchema).default([]),
+    // Filings are validated one at a time; odd ones are skipped.
+    filings_with_data: z.array(z.unknown()).nullish(),
+    filings_without_data: z.array(z.unknown()).nullish(),
   })
   .passthrough();
 
@@ -131,9 +139,13 @@ export interface FunderProfile extends FunderSummary {
 
 export interface FunderSearchResult {
   organizations: FunderSummary[];
-  total: number;
+  /** Null when ProPublica did not report a usable count. */
+  total: number | null;
   page: number;
-  totalPages: number;
+  /** Null when ProPublica did not report a usable count. */
+  totalPages: number | null;
+  /** Rows on this page dropped because they did not match the expected shape. */
+  skipped: number;
 }
 
 export interface IFunderClient {
@@ -187,17 +199,60 @@ function summary(org: z.infer<typeof searchOrganizationSchema>): FunderSummary {
 
 type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
+/** Keeps the rows that match `schema` and drops the rest. */
+function validRows<T>(schema: z.ZodType<T, z.ZodTypeDef, unknown>, rows: unknown[]): T[] {
+  return rows.flatMap((row) => {
+    const parsed = schema.safeParse(row);
+    return parsed.success ? [parsed.data] : [];
+  });
+}
+
+/** Resolves undefined when the body is not JSON (for example an HTML error page). */
+async function readJson(response: Response): Promise<unknown> {
+  try {
+    return (await response.json()) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
 export class ProPublicaFunderClient implements IFunderClient {
   constructor(
     private readonly fetchImpl: FetchLike = (url, init) => fetch(url, init),
     private readonly baseUrl: string = PROPUBLICA_API_BASE_URL,
+    private readonly timeoutMs: number = PROPUBLICA_TIMEOUT_MS,
   ) {}
 
-  private async request(path: string, params: URLSearchParams): Promise<Response> {
+  /**
+   * Fetches and decodes one ProPublica response. Every failure is thrown as a
+   * short, plain message because the tools pass it straight to the assistant.
+   */
+  private async request(
+    what: string,
+    path: string,
+    params: URLSearchParams,
+  ): Promise<{ status: number; ok: boolean; body: unknown }> {
     const query = params.toString();
-    return this.fetchImpl(`${this.baseUrl}${path}${query ? `?${query}` : ''}`, {
-      headers: { Accept: 'application/json' },
-    });
+    const signal = AbortSignal.timeout(this.timeoutMs);
+    try {
+      const response = await this.fetchImpl(`${this.baseUrl}${path}${query ? `?${query}` : ''}`, {
+        headers: { Accept: 'application/json' },
+        signal,
+      });
+      if (response.status === 429) {
+        throw new Error('ProPublica rate limit reached (HTTP 429). Wait a minute and try again.');
+      }
+      // Reading the body is covered by the same timeout as the request.
+      return { status: response.status, ok: response.ok, body: await readJson(response) };
+    } catch (err) {
+      if (signal.aborted) {
+        throw new Error(`ProPublica ${what} timed out after ${this.timeoutMs / 1000} seconds`, {
+          cause: err,
+        });
+      }
+      if (err instanceof Error && err.message.startsWith('ProPublica ')) throw err;
+      throw new Error(`ProPublica ${what} failed: could not reach the API`, { cause: err });
+    }
   }
 
   async searchOrganizations({
@@ -211,22 +266,33 @@ export class ProPublicaFunderClient implements IFunderClient {
   }): Promise<FunderSearchResult> {
     const params = new URLSearchParams({ q: query, page: String(page - 1) });
     if (state) params.set('state[id]', state);
-    const response = await this.request('/search.json', params);
-    // ProPublica answers an empty search with 404 and an empty result body.
+    const response = await this.request('search', '/search.json', params);
     if (!response.ok && response.status !== 404) {
       throw new Error(`ProPublica search failed with HTTP ${response.status}`);
     }
-    const body = searchResponseSchema.parse(await response.json());
+    const parsed = searchResponseSchema.safeParse(response.body);
+    if (!parsed.success) {
+      // ProPublica answers an empty search with 404, normally with an empty
+      // result body; treat a 404 without one the same way.
+      if (response.status === 404) {
+        return { organizations: [], total: 0, page, totalPages: 0, skipped: 0 };
+      }
+      throw new Error('ProPublica search returned a response in an unexpected format');
+    }
+    const body = parsed.data;
+    const organizations = validRows(searchOrganizationSchema, body.organizations);
     return {
-      organizations: body.organizations.map(summary),
+      organizations: organizations.map(summary),
       total: body.total_results,
       page,
       totalPages: body.num_pages,
+      skipped: body.organizations.length - organizations.length,
     };
   }
 
   async getOrganization(ein: string): Promise<FunderProfile | null> {
     const response = await this.request(
+      'organization lookup',
       `/organizations/${formatEin(ein)}.json`,
       new URLSearchParams(),
     );
@@ -234,14 +300,20 @@ export class ProPublicaFunderClient implements IFunderClient {
     if (!response.ok) {
       throw new Error(`ProPublica organization lookup failed with HTTP ${response.status}`);
     }
-    const body = organizationResponseSchema.parse(await response.json());
+    const parsed = organizationResponseSchema.safeParse(response.body);
+    if (!parsed.success) {
+      throw new Error('ProPublica organization lookup returned a response in an unexpected format');
+    }
+    const body = parsed.data;
     const org = body.organization;
+    const filingsWithData = validRows(filingWithDataSchema, body.filings_with_data ?? []);
+    const filingsWithoutData = validRows(filingWithoutDataSchema, body.filings_without_data ?? []);
     // Unknown EINs come back as a placeholder record rather than a 404,
     // sometimes with unrelated PDF-only filings attached.
-    if (org.subsection_code == null && body.filings_with_data.length === 0) return null;
+    if (org.subsection_code == null && filingsWithData.length === 0) return null;
 
-    const latest = [...body.filings_with_data].sort((a, b) => b.tax_prd_yr - a.tax_prd_yr).at(0);
-    const filings = [...body.filings_with_data, ...body.filings_without_data]
+    const latest = [...filingsWithData].sort((a, b) => b.tax_prd_yr - a.tax_prd_yr).at(0);
+    const filings = [...filingsWithData, ...filingsWithoutData]
       .map((f) => ({
         taxYear: f.tax_prd_yr,
         formType: formType(f.formtype),
