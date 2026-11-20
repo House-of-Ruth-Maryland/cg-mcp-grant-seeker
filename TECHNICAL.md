@@ -50,6 +50,11 @@ are organizations without deadlines or status, so they are never mixed into oppo
 search or shortlists. Search matches names and cities only, and IRS data lags one to two
 years. Results carry an attribution string; cite ProPublica when publishing the data.
 
+Each ProPublica request times out after 10 seconds. Rows that arrive in an unusable shape
+are left out rather than failing the call, and `search_funders` reports how many in its
+`skipped` field; `total` and `hasNextPage` are null when ProPublica's counts are unusable.
+Rate limiting (HTTP 429) and other upstream failures come back as a short `error` string.
+
 All tools are read-only and carry the MCP annotations (`readOnlyHint`,
 `openWorldHint`) the Claude and OpenAI marketplaces require.
 
