@@ -27,11 +27,13 @@ source you register.
 
 ## Tools
 
-| Tool                   | What it does                                                          |
-| ---------------------- | --------------------------------------------------------------------- |
-| `list_grant_sources`   | Lists the registered CommonGrants sources                             |
-| `search_opportunities` | Searches bounded pages from one source or fans out across all sources |
-| `get_opportunity`      | Fetches the complete SDK-validated opportunity from a named source    |
+| Tool                   | What it does                                                           |
+| ---------------------- | ---------------------------------------------------------------------- |
+| `list_grant_sources`   | Lists the registered CommonGrants sources                              |
+| `search_opportunities` | Searches bounded pages from one source or fans out across all sources  |
+| `get_opportunity`      | Fetches the complete SDK-validated opportunity from a named source     |
+| `search_funders`       | Finds nonprofits and foundations by name/city in IRS data (ProPublica) |
+| `get_funder`           | Gets an organization's type, finances, and 990 filings by EIN          |
 
 The hosted MCP App also exposes `present_opportunity_shortlist`. An assistant
 uses the three headless tools for iterative research, then automatically calls
@@ -41,6 +43,17 @@ user for permission before running the tool. A successful call produces one
 stable, globally ranked review surface instead of attaching transient UI to
 every search; a denied or failed call falls back to a concise plain-text
 shortlist. The stdio server remains headless.
+
+The funder tools use the free [ProPublica Nonprofit Explorer API](https://projects.propublica.org/nonprofits/api)
+(no key required). They are funder prospect research, not a CommonGrants source: results
+are organizations without deadlines or status, so they are never mixed into opportunity
+search or shortlists. Search matches names and cities only, and IRS data lags one to two
+years. Results carry an attribution string; cite ProPublica when publishing the data.
+
+Each ProPublica request times out after 10 seconds. Rows that arrive in an unusable shape
+are left out rather than failing the call, and `search_funders` reports how many in its
+`skipped` field; `total` and `hasNextPage` are null when ProPublica's counts are unusable.
+Rate limiting (HTTP 429) and other upstream failures come back as a short `error` string.
 
 All tools are read-only and carry the MCP annotations (`readOnlyHint`,
 `openWorldHint`) the Claude and OpenAI marketplaces require.

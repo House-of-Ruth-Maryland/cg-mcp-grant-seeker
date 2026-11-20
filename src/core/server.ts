@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createClients } from './client.js';
+import { registerFunderTools } from './funder-tools.js';
 import { registerTools } from './tools.js';
 import type { CoreToolRegistrar } from './tools.js';
 import type { ICommonGrantsClient, SourceConfig } from './types.js';
@@ -19,5 +20,6 @@ export function createServer(sources: SourceConfig[]): McpServer {
   const server = new McpServer(SERVER_INFO);
   const registerTool = server.registerTool.bind(server) as unknown as CoreToolRegistrar;
   registerTools(registerTool, clients);
+  registerFunderTools(registerTool);
   return server;
 }
